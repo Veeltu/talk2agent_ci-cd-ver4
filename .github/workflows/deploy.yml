@@ -1,0 +1,50 @@
+name: Deploy Agent to Vertex AI
+
+on:
+  push:
+    branches: [main, master] 
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy
+        working-directory: ./talk2api-main
+        env:
+          GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          # Sensitive keys — set once in GitHub UI
+          APIKEY_CREDENTIAL: ${{ secrets.APIKEY_CREDENTIAL }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        run: |
+          pip install uv
+          uv pip install --system google-genai google-adk python-dotenv requests
+          
+          # Build .env from config + secrets
+          cp config.env .env
+          {
+            echo ""
+            echo "APIKEY_CREDENTIAL=${APIKEY_CREDENTIAL}"
+            echo "GOOGLE_API_KEY=${GOOGLE_API_KEY}"
+            echo "APIHUB_SA_KEY_JSON=$(echo "${GCP_SERVICE_ACCOUNT_KEY}" | jq -c .)"
+          } >> .env
+          
+          # Setup SA key for deploy
+          printenv GCP_SERVICE_ACCOUNT_KEY > service-account-key.json
+          export GOOGLE_APPLICATION_CREDENTIALS="./service-account-key.json"
+          
+          chmod +x full_deploy.sh && ./full_deploy.sh
+          rm -f service-account-key.json
