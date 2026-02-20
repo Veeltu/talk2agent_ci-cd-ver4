@@ -44,6 +44,34 @@ cd "$PROJECT_ROOT"
 # STEP 1: DEPLOY AGENT TO VERTEX AI AGENT ENGINE
 # ==============================================================================
 
+# Get token for REST API calls
+DEPLOY_TOKEN="$(gcloud auth print-access-token)"
+
+# Delete existing reasoning engine(s) with the same display name
+RE_LIST_URL="https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/reasoningEngines"
+
+EXISTING_ENGINE_IDS=$(curl -s \
+  -H "Authorization: Bearer $DEPLOY_TOKEN" \
+  "$RE_LIST_URL" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for re in data.get('reasoningEngines', []):
+    if re.get('displayName') == '${AGENT_DISPLAY_NAME}':
+        print(re['name'].split('/')[-1])
+" 2>/dev/null || true)
+
+if [[ -n "$EXISTING_ENGINE_IDS" ]]; then
+    echo "🗑️  Deleting existing reasoning engine(s) with name '$AGENT_DISPLAY_NAME'..."
+    while IFS= read -r eid; do
+        [[ -z "$eid" ]] && continue
+        echo "   Deleting: $eid"
+        curl -s -X DELETE \
+          -H "Authorization: Bearer $DEPLOY_TOKEN" \
+          "${RE_LIST_URL}/${eid}" >/dev/null 2>&1 || echo "   ⚠️  Could not delete $eid — continuing"
+    done <<< "$EXISTING_ENGINE_IDS"
+    echo "   ✅ Cleanup done"
+fi
+
 echo ""
 echo "============================================================"
 echo "🚀 VERTEX AI AGENT ENGINE DEPLOYMENT"
@@ -52,7 +80,6 @@ echo "Project: $PROJECT_ID"
 echo "Region: $REGION"
 echo "Staging Bucket: $STAGING_BUCKET"
 echo "Display Name: $AGENT_DISPLAY_NAME"
-[[ -n "$RESOURCE_NAME" ]] && echo "Resource Name: $RESOURCE_NAME (UPDATE mode)"
 echo "============================================================"
 echo ""
 
@@ -88,14 +115,19 @@ REASONING_ENGINE_ID=$(echo "$DEPLOY_OUTPUT" | grep -oE 'reasoningEngines/[^/[:sp
 # Get PROJECT_NUMBER (needed for both extraction and registration)
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")"
 
-# If not found in output, try to get it from gcloud
+# If not found in output, try to get it from REST API
 if [[ -z "$REASONING_ENGINE_ID" ]]; then
-    echo "🔍 Extracting REASONING_ENGINE_ID from gcloud..."
-    REASONING_ENGINE_ID=$(gcloud ai reasoning-engines list \
-        --project="$PROJECT_ID" \
-        --region="$REGION" \
-        --filter="displayName:$AGENT_DISPLAY_NAME" \
-        --format="value(name)" 2>/dev/null | sed 's|.*reasoningEngines/||' | head -1)
+    echo "🔍 Extracting REASONING_ENGINE_ID from API..."
+    REASONING_ENGINE_ID=$(curl -s \
+      -H "Authorization: Bearer $DEPLOY_TOKEN" \
+      "$RE_LIST_URL" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for re in data.get('reasoningEngines', []):
+    if re.get('displayName') == '${AGENT_DISPLAY_NAME}':
+        print(re['name'].split('/')[-1])
+        break
+" 2>/dev/null || true)
 fi
 
 # If still not found, exit with error (no interactive prompt in CI/CD)
@@ -201,7 +233,20 @@ echo "============================================================"
 
 # Setup
 REASONING_ENGINE="projects/${PROJECT_NUMBER}/locations/${REGION}/reasoningEngines/${REASONING_ENGINE_ID}"
-API_URL="https://discoveryengine.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/global/collections/default_collection/engines/${AS_APP}/assistants/default_assistant/agents"
+AGENTS_URL="https://discoveryengine.googleapis.com/v1alpha/projects/${PROJECT_NUMBER}/locations/global/collections/default_collection/engines/${AS_APP}/assistants/default_assistant/agents"
+
+AGENT_PAYLOAD="{
+  \"displayName\": \"${AGENT_DISPLAY_NAME}\",
+  \"description\": \"${AGENT_DESCRIPTION}\",
+  \"adk_agent_definition\": {
+    \"tool_settings\": {
+      \"tool_description\": \"${AGENT_DESCRIPTION}\"
+    },
+    \"provisioned_reasoning_engine\": {
+      \"reasoning_engine\": \"${REASONING_ENGINE}\"
+    }
+  }
+}"
 
 echo ""
 echo "============================================================"
@@ -211,24 +256,40 @@ echo "   Agent: $AGENT_DISPLAY_NAME"
 echo "   Reasoning Engine: $REASONING_ENGINE_ID"
 echo "   Agentspace App: $AS_APP"
 
-# Register agent
+# Delete existing agents with the same display name
+EXISTING_AGENTS=$(curl -s \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "X-Goog-User-Project: ${PROJECT_NUMBER}" \
+  "$AGENTS_URL")
+
+EXISTING_AGENT_NAMES=$(echo "$EXISTING_AGENTS" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for agent in data.get('agents', []):
+    if agent.get('displayName') == '${AGENT_DISPLAY_NAME}':
+        print(agent['name'])
+" 2>/dev/null || true)
+
+if [[ -n "$EXISTING_AGENT_NAMES" ]]; then
+    echo "   🗑️  Deleting existing agent(s) with name '$AGENT_DISPLAY_NAME'..."
+    while IFS= read -r agent_name; do
+        [[ -z "$agent_name" ]] && continue
+        echo "   Deleting: $agent_name"
+        curl -s -X DELETE \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "X-Goog-User-Project: ${PROJECT_NUMBER}" \
+          "https://discoveryengine.googleapis.com/v1alpha/${agent_name}" >/dev/null 2>&1 || true
+    done <<< "$EXISTING_AGENT_NAMES"
+fi
+
+# Create new agent
+echo "   📝 Creating agent..."
 RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H "X-Goog-User-Project: ${PROJECT_NUMBER}" \
-  "$API_URL" \
-  -d "{
-    \"displayName\": \"${AGENT_DISPLAY_NAME}\",
-    \"description\": \"${AGENT_DESCRIPTION}\",
-    \"adk_agent_definition\": {
-      \"tool_settings\": {
-        \"tool_description\": \"${AGENT_DESCRIPTION}\"
-      },
-      \"provisioned_reasoning_engine\": {
-        \"reasoning_engine\": \"${REASONING_ENGINE}\"
-      }
-    }
-  }")
+  "$AGENTS_URL" \
+  -d "$AGENT_PAYLOAD")
 
 HTTP_CODE="${RESPONSE##*$'\n'}"
 BODY="${RESPONSE%$'\n'*}"
